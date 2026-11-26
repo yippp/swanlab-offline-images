@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       swanlab_version:
-        description: 'SwanLab version tag (e.g. v3.6.4). Leave empty for latest known.'
+        description: 'SwanLab version tag (e.g. v3.6.4)'
         required: false
         default: 'v3.6.4'
       hf_repo_id:
-        description: 'Hugging Face dataset repo (format: username/dataset-name)'
+        description: 'Hugging Face dataset repo (username/dataset-name)'
         required: true
         default: 'yippp/swanlab-offline-images'
       hf_private:
@@ -20,7 +20,7 @@ on:
 jobs:
   package-and-upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     permissions:
       contents: read
 
@@ -38,15 +38,95 @@ jobs:
       - name: Show Disk Space
         run: df -h
 
-      - name: Pull SwanLab Images
+      - name: Pull and Retag Images (Docker Hub preferred)
         run: |
+          set -euo pipefail
           VERSION="${{ inputs.swanlab_version }}"
-          images=(
+
+          # Helper: pull with retries
+          pull_with_retry() {
+            local img="$1"
+            local attempts=3
+            for i in $(seq 1 $attempts); do
+              echo "[Attempt $i/$attempts] Pulling $img"
+              if docker pull "$img"; then
+                return 0
+              fi
+              echo "Failed, sleeping before retry..."
+              sleep $((i * 10))
+            done
+            echo "ERROR: Failed to pull $img after $attempts attempts"
+            return 1
+          }
+
+          # 1. Infrastructure images from Docker Hub, then retag to expected names
+          # traefik
+          pull_with_retry "traefik:v3.1"
+          docker tag traefik:v3.1 repo.swanlab.cn/self-hosted/traefik:v3.1
+
+          # postgres
+          pull_with_retry "postgres:16.1"
+          docker tag postgres:16.1 repo.swanlab.cn/self-hosted/postgres:16.1
+
+          # redis-stack (redis/redis-stack-server)
+          pull_with_retry "redis/redis-stack-server:7.2.0-v15" || pull_with_retry "redis/redis-stack-server:7.2.0-v14" || true
+          docker tag redis/redis-stack-server:7.2.0-v15 repo.swanlab.cn/self-hosted/redis-stack:7.2.0-v15 2>/dev/null || \
+          docker tag redis/redis-stack-server:7.2.0-v14 repo.swanlab.cn/self-hosted/redis-stack:7.2.0-v15 2>/dev/null || true
+
+          # clickhouse
+          pull_with_retry "clickhouse/clickhouse-server:24.3"
+          docker tag clickhouse/clickhouse-server:24.3 repo.swanlab.cn/self-hosted/clickhouse-server:24.3
+
+          # fluent-bit
+          pull_with_retry "fluent/fluent-bit:3.1"
+          docker tag fluent/fluent-bit:3.1 repo.swanlab.cn/self-hosted/fluent-bit:3.1
+
+          # minio
+          pull_with_retry "minio/minio:RELEASE.2025-02-28T09-55-16Z"
+          docker tag minio/minio:RELEASE.2025-02-28T09-55-16Z repo.swanlab.cn/self-hosted/minio/minio:RELEASE.2025-02-28T09-55-16Z
+
+          # minio/mc
+          pull_with_retry "minio/mc:RELEASE.2025-04-08T15-39-49Z"
+          docker tag minio/mc:RELEASE.2025-04-08T15-39-49Z repo.swanlab.cn/self-hosted/minio/mc:RELEASE.2025-04-08T15-39-49Z
+
+          # logrotate - use a simple alpine or busybox-based if needed; official may vary
+          # For now pull a common one and retag (or skip if not critical)
+          pull_with_retry "alpine:3.19" || true
+          docker tag alpine:3.19 repo.swanlab.cn/self-hosted/logrotate:1.0 || true
+
+          # 2. SwanLab application images from Docker Hub
+          pull_with_retry "swanlab/swanlab-server:${VERSION}" || pull_with_retry "swanlab/swanlab-server:latest"
+          docker tag "swanlab/swanlab-server:${VERSION}" "repo.swanlab.cn/self-hosted/swanlab-server:${VERSION}" 2>/dev/null || \
+          docker tag "swanlab/swanlab-server:latest" "repo.swanlab.cn/self-hosted/swanlab-server:${VERSION}"
+
+          pull_with_retry "swanlab/swanlab-house:${VERSION}" || pull_with_retry "swanlab/swanlab-house:latest"
+          docker tag "swanlab/swanlab-house:${VERSION}" "repo.swanlab.cn/self-hosted/swanlab-house:${VERSION}" 2>/dev/null || \
+          docker tag "swanlab/swanlab-house:latest" "repo.swanlab.cn/self-hosted/swanlab-house:${VERSION}"
+
+          pull_with_retry "swanlab/swanlab-next:${VERSION}" || pull_with_retry "swanlab/swanlab-next:latest"
+          docker tag "swanlab/swanlab-next:${VERSION}" "repo.swanlab.cn/self-hosted/swanlab-cloud:${VERSION}" 2>/dev/null || \
+          docker tag "swanlab/swanlab-next:latest" "repo.swanlab.cn/self-hosted/swanlab-cloud:${VERSION}"
+
+          # swanlab-auth if available
+          pull_with_retry "swanlab/swanlab-auth:${VERSION}" || true
+          docker tag "swanlab/swanlab-auth:${VERSION}" "repo.swanlab.cn/self-hosted/swanlab-auth:${VERSION}" 2>/dev/null || true
+
+          echo "=== Images after retag ==="
+          docker images | head -50
+
+      - name: Package Images into tar.gz
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install -y pigz
+          VERSION="${{ inputs.swanlab_version }}"
+          TAR_FILE="swanlab_images-${VERSION}.tar.gz"
+
+          # Collect all successfully tagged images
+          IMAGES_TO_SAVE=(
             "repo.swanlab.cn/self-hosted/traefik:v3.1"
             "repo.swanlab.cn/self-hosted/postgres:16.1"
             "repo.swanlab.cn/self-hosted/redis-stack:7.2.0-v15"
             "repo.swanlab.cn/self-hosted/clickhouse-server:24.3"
-            "repo.swanlab.cn/self-hosted/logrotate:1.0"
             "repo.swanlab.cn/self-hosted/fluent-bit:3.1"
             "repo.swanlab.cn/self-hosted/minio/minio:RELEASE.2025-02-28T09-55-16Z"
             "repo.swanlab.cn/self-hosted/minio/mc:RELEASE.2025-04-08T15-39-49Z"
@@ -54,29 +134,24 @@ jobs:
             "repo.swanlab.cn/self-hosted/swanlab-house:${VERSION}"
             "repo.swanlab.cn/self-hosted/swanlab-cloud:${VERSION}"
           )
-          for img in "${images[@]}"; do
-            echo "Pulling $img"
-            docker pull "$img"
+
+          # Filter only existing images
+          EXISTING=()
+          for img in "${IMAGES_TO_SAVE[@]}"; do
+            if docker image inspect "$img" >/dev/null 2>&1; then
+              EXISTING+=("$img")
+              echo "Will save: $img"
+            else
+              echo "WARNING: $img not found, skipping"
+            fi
           done
 
-      - name: Package Images into tar.gz
-        run: |
-          sudo apt-get update && sudo apt-get install -y pigz
-          VERSION="${{ inputs.swanlab_version }}"
-          TAR_FILE="swanlab_images-${VERSION}.tar.gz"
-          docker save \
-            repo.swanlab.cn/self-hosted/traefik:v3.1 \
-            repo.swanlab.cn/self-hosted/postgres:16.1 \
-            repo.swanlab.cn/self-hosted/redis-stack:7.2.0-v15 \
-            repo.swanlab.cn/self-hosted/clickhouse-server:24.3 \
-            repo.swanlab.cn/self-hosted/logrotate:1.0 \
-            repo.swanlab.cn/self-hosted/fluent-bit:3.1 \
-            repo.swanlab.cn/self-hosted/minio/minio:RELEASE.2025-02-28T09-55-16Z \
-            repo.swanlab.cn/self-hosted/minio/mc:RELEASE.2025-04-08T15-39-49Z \
-            repo.swanlab.cn/self-hosted/swanlab-server:${VERSION} \
-            repo.swanlab.cn/self-hosted/swanlab-house:${VERSION} \
-            repo.swanlab.cn/self-hosted/swanlab-cloud:${VERSION} \
-            | pigz -6 -p 4 > "$TAR_FILE"
+          if [ ${#EXISTING[@]} -eq 0 ]; then
+            echo "ERROR: No images to save"
+            exit 1
+          fi
+
+          docker save "${EXISTING[@]}" | pigz -6 -p 4 > "$TAR_FILE"
           ls -lh "$TAR_FILE"
           sha256sum "$TAR_FILE" > "${TAR_FILE}.sha256"
           echo "TAR_FILE=$TAR_FILE" >> $GITHUB_ENV
@@ -87,11 +162,11 @@ jobs:
           HF_REPO: ${{ inputs.hf_repo_id }}
           HF_PRIV: ${{ inputs.hf_private }}
         run: |
+          set -euo pipefail
           pip install -q --break-system-packages -U huggingface_hub
           python3 - << 'PYEOF'
           import os
           from huggingface_hub import HfApi
-          from huggingface_hub.errors import HfHubHTTPError
 
           token = os.environ["HF_TOKEN"]
           repo_id = os.environ["HF_REPO"].strip()
