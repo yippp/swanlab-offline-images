@@ -8,11 +8,11 @@ on:
         required: false
         default: 'v3.6.4'
       hf_repo_id:
-        description: 'Hugging Face dataset repo (username/dataset-name)'
+        description: 'Hugging Face dataset repo (e.g. TPAMI/swanlab-offline-images)'
         required: true
-        default: 'yippp/swanlab-offline-images'
+        default: 'TPAMI/swanlab-offline-images'
       hf_private:
-        description: 'Make the Hugging Face dataset private?'
+        description: 'Make the Hugging Face dataset private? (only used when creating new)'
         type: boolean
         required: true
         default: false
@@ -43,7 +43,6 @@ jobs:
           set -euo pipefail
           VERSION="${{ inputs.swanlab_version }}"
 
-          # Helper: pull with retries
           pull_with_retry() {
             local img="$1"
             local attempts=3
@@ -59,7 +58,6 @@ jobs:
             return 1
           }
 
-          # Helper: try multiple sources until one works
           pull_first_available() {
             local dest_tag="$1"
             shift
@@ -74,14 +72,12 @@ jobs:
             return 1
           }
 
-          # 1. Infrastructure images
           pull_with_retry "traefik:v3.1"
           docker tag traefik:v3.1 repo.swanlab.cn/self-hosted/traefik:v3.1
 
           pull_with_retry "postgres:16.1"
           docker tag postgres:16.1 repo.swanlab.cn/self-hosted/postgres:16.1
 
-          # redis-stack
           pull_first_available "repo.swanlab.cn/self-hosted/redis-stack:7.2.0-v15" \
             "redis/redis-stack-server:7.2.0-v15" \
             "redis/redis-stack-server:7.2.0-v14" || true
@@ -92,7 +88,6 @@ jobs:
           pull_with_retry "fluent/fluent-bit:3.1"
           docker tag fluent/fluent-bit:3.1 repo.swanlab.cn/self-hosted/fluent-bit:3.1
 
-          # MinIO - official exact tag is gone, use community mirrors
           pull_first_available "repo.swanlab.cn/self-hosted/minio/minio:RELEASE.2025-02-28T09-55-16Z" \
             "alpine/minio:RELEASE.2025-02-28T09-55-16Z" \
             "apecloud/minio:RELEASE.2025-02-28T09-55-16Z" \
@@ -100,17 +95,14 @@ jobs:
             "alpine/minio:RELEASE.2025-10-15T17-29-55Z" \
             "apecloud/minio:latest" || true
 
-          # MinIO mc
           pull_first_available "repo.swanlab.cn/self-hosted/minio/mc:RELEASE.2025-04-08T15-39-49Z" \
             "minio/mc:RELEASE.2025-04-08T15-39-49Z" \
             "minio/mc:latest" \
             "leanon/minio-mc:latest" || true
 
-          # logrotate placeholder
           pull_with_retry "alpine:3.19" || true
           docker tag alpine:3.19 repo.swanlab.cn/self-hosted/logrotate:1.0 || true
 
-          # 2. SwanLab application images
           pull_first_available "repo.swanlab.cn/self-hosted/swanlab-server:${VERSION}" \
             "swanlab/swanlab-server:${VERSION}" \
             "swanlab/swanlab-server:latest" || true
@@ -179,7 +171,9 @@ jobs:
           pip install -q --break-system-packages -U huggingface_hub
           python3 - << 'PYEOF'
           import os
+          import sys
           from huggingface_hub import HfApi
+          from huggingface_hub.errors import HfHubHTTPError
 
           token = os.environ["HF_TOKEN"]
           repo_id = os.environ["HF_REPO"].strip()
@@ -188,9 +182,28 @@ jobs:
 
           api = HfApi(token=token)
 
-          if not api.repo_exists(repo_id, repo_type="dataset"):
-              api.create_repo(repo_id=repo_id, repo_type="dataset", private=is_private, exist_ok=True)
-              print(f"Created dataset {repo_id}")
+          print(f"Target dataset: {repo_id}")
+
+          try:
+              exists = api.repo_exists(repo_id, repo_type="dataset")
+          except Exception as e:
+              print(f"Warning: could not check if repo exists: {e}")
+              exists = False
+
+          if not exists:
+              print(f"Dataset {repo_id} does not exist, attempting to create...")
+              try:
+                  api.create_repo(repo_id=repo_id, repo_type="dataset", private=is_private, exist_ok=True)
+                  print(f"Created dataset {repo_id}")
+              except HfHubHTTPError as e:
+                  print(f"ERROR: Failed to create dataset {repo_id}")
+                  print(f"Details: {e}")
+                  print("Please make sure:")
+                  print("  1. The HF_TOKEN has write permission for this namespace")
+                  print("  2. Or create the dataset manually first")
+                  sys.exit(1)
+          else:
+              print(f"Dataset {repo_id} already exists, will upload to it")
 
           print(f"Uploading {tar_file} ...")
           api.upload_file(
