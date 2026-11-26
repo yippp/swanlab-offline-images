@@ -1,0 +1,123 @@
+name: Package SwanLab Images & Upload to Hugging Face
+
+on:
+  workflow_dispatch:
+    inputs:
+      swanlab_version:
+        description: 'SwanLab version tag (e.g. v3.6.4). Leave empty for latest known.'
+        required: false
+        default: 'v3.6.4'
+      hf_repo_id:
+        description: 'Hugging Face dataset repo (format: username/dataset-name)'
+        required: true
+        default: 'yippp/swanlab-offline-images'
+      hf_private:
+        description: 'Make the Hugging Face dataset private?'
+        type: boolean
+        required: true
+        default: false
+
+jobs:
+  package-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+
+    steps:
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Show Disk Space
+        run: df -h
+
+      - name: Pull SwanLab Images
+        run: |
+          VERSION="${{ inputs.swanlab_version }}"
+          images=(
+            "repo.swanlab.cn/self-hosted/traefik:v3.1"
+            "repo.swanlab.cn/self-hosted/postgres:16.1"
+            "repo.swanlab.cn/self-hosted/redis-stack:7.2.0-v15"
+            "repo.swanlab.cn/self-hosted/clickhouse-server:24.3"
+            "repo.swanlab.cn/self-hosted/logrotate:1.0"
+            "repo.swanlab.cn/self-hosted/fluent-bit:3.1"
+            "repo.swanlab.cn/self-hosted/minio/minio:RELEASE.2025-02-28T09-55-16Z"
+            "repo.swanlab.cn/self-hosted/minio/mc:RELEASE.2025-04-08T15-39-49Z"
+            "repo.swanlab.cn/self-hosted/swanlab-server:${VERSION}"
+            "repo.swanlab.cn/self-hosted/swanlab-house:${VERSION}"
+            "repo.swanlab.cn/self-hosted/swanlab-cloud:${VERSION}"
+          )
+          for img in "${images[@]}"; do
+            echo "Pulling $img"
+            docker pull "$img"
+          done
+
+      - name: Package Images into tar.gz
+        run: |
+          sudo apt-get update && sudo apt-get install -y pigz
+          VERSION="${{ inputs.swanlab_version }}"
+          TAR_FILE="swanlab_images-${VERSION}.tar.gz"
+          docker save \
+            repo.swanlab.cn/self-hosted/traefik:v3.1 \
+            repo.swanlab.cn/self-hosted/postgres:16.1 \
+            repo.swanlab.cn/self-hosted/redis-stack:7.2.0-v15 \
+            repo.swanlab.cn/self-hosted/clickhouse-server:24.3 \
+            repo.swanlab.cn/self-hosted/logrotate:1.0 \
+            repo.swanlab.cn/self-hosted/fluent-bit:3.1 \
+            repo.swanlab.cn/self-hosted/minio/minio:RELEASE.2025-02-28T09-55-16Z \
+            repo.swanlab.cn/self-hosted/minio/mc:RELEASE.2025-04-08T15-39-49Z \
+            repo.swanlab.cn/self-hosted/swanlab-server:${VERSION} \
+            repo.swanlab.cn/self-hosted/swanlab-house:${VERSION} \
+            repo.swanlab.cn/self-hosted/swanlab-cloud:${VERSION} \
+            | pigz -6 -p 4 > "$TAR_FILE"
+          ls -lh "$TAR_FILE"
+          sha256sum "$TAR_FILE" > "${TAR_FILE}.sha256"
+          echo "TAR_FILE=$TAR_FILE" >> $GITHUB_ENV
+
+      - name: Upload to Hugging Face
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ inputs.hf_repo_id }}
+          HF_PRIV: ${{ inputs.hf_private }}
+        run: |
+          pip install -q --break-system-packages -U huggingface_hub
+          python3 - << 'PYEOF'
+          import os
+          from huggingface_hub import HfApi
+          from huggingface_hub.errors import HfHubHTTPError
+
+          token = os.environ["HF_TOKEN"]
+          repo_id = os.environ["HF_REPO"].strip()
+          is_private = os.environ.get("HF_PRIV", "false").lower() == "true"
+          tar_file = os.environ["TAR_FILE"]
+
+          api = HfApi(token=token)
+
+          if not api.repo_exists(repo_id, repo_type="dataset"):
+              api.create_repo(repo_id=repo_id, repo_type="dataset", private=is_private, exist_ok=True)
+              print(f"Created dataset {repo_id}")
+
+          print(f"Uploading {tar_file} ...")
+          api.upload_file(
+              path_or_fileobj=tar_file,
+              path_in_repo=tar_file,
+              repo_id=repo_id,
+              repo_type="dataset",
+              commit_message=f"Upload {tar_file}"
+          )
+          api.upload_file(
+              path_or_fileobj=f"{tar_file}.sha256",
+              path_in_repo=f"{tar_file}.sha256",
+              repo_id=repo_id,
+              repo_type="dataset",
+              commit_message=f"Upload SHA256 for {tar_file}"
+          )
+          print("Upload complete!")
+          PYEOF
